@@ -1,402 +1,381 @@
 """
 Coconut Maturity Classification Inference Script
-Supports real-time inference on audio files using ONNX Runtime
+Supports ONNX Runtime inference with audio format conversion utilities
 """
 
-import io
+import argparse
 import json
 import random
+import warnings
 from pathlib import Path
-from typing import Union
+from typing import Optional, Tuple, Union
 
 import librosa
 import numpy as np
 import onnxruntime as ort
 import soundfile as sf
 
-
-# Configuration
-class InferenceConfig:
-    SAMPLE_RATE = 44100
-    SIGNAL_LENGTH = 132300  # 3 seconds
-    N_MFCC = 40
-    N_FFT = 2048
-    HOP_LENGTH = 512
-
-    MODEL_DIR = Path("models")  # Directory where models are saved
-    MODEL_FILENAME = "coconut_maturity_model.onnx"
-    LABEL_MAP_FILENAME = "label_map.json"
-
-    @classmethod
-    def get_model_path(cls):
-        """Get full path for ONNX model."""
-        return cls.MODEL_DIR / cls.MODEL_FILENAME
-
-    @classmethod
-    def get_label_map_path(cls):
-        """Get full path for label map."""
-        return cls.MODEL_DIR / cls.LABEL_MAP_FILENAME
+warnings.filterwarnings("ignore", category=UserWarning, module="numba")
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 
-class AudioProcessor:
-    """Utility class for audio format conversion and preprocessing."""
+class AudioConverter:
+    """Utility class for converting various audio formats to binary format"""
 
     @staticmethod
-    def load_audio_from_file(
-        filepath: Union[str, Path], sr: int = InferenceConfig.SAMPLE_RATE
-    ) -> np.ndarray:
+    def load_audio(
+        audio_path: str, target_sr: int = 44100, duration: Optional[float] = 3.0
+    ) -> Tuple[np.ndarray, int]:
         """
-        Load audio from various file formats.
-
-        Supported formats: WAV, MP3, OGG, FLAC, M4A
-        """
-        audio, _ = librosa.load(filepath, sr=sr, mono=True)
-        return audio
-
-    @staticmethod
-    def load_audio_from_binary(
-        binary_data: bytes, sr: int = InferenceConfig.SAMPLE_RATE
-    ) -> np.ndarray:
-        """
-        Load audio from binary data.
+        Load audio file and convert to target sample rate
 
         Args:
-            binary_data: Raw audio bytes (WAV, MP3, etc.)
-            sr: Target sample rate
+            audio_path: Path to audio file
+            target_sr: Target sample rate (default: 44100)
+            duration: Duration to load in seconds (default: 3.0)
+
+        Returns:
+            audio: Audio signal as numpy array
+            sr: Sample rate
+        """
+        # Load audio with librosa (handles most formats)
+        audio, sr = librosa.load(audio_path, sr=target_sr, duration=duration)
+        return audio, sr
+
+    @staticmethod
+    def convert_to_wav(
+        input_path: Union[str, Path],
+        output_path: Optional[Union[str, Path]] = None,
+        sample_rate: int = 44100,
+    ) -> str:
+        """
+        Convert audio file to WAV format
+
+        Args:
+            input_path: Path to input audio file
+            output_path: Path to output WAV file (optional)
+            sample_rate: Target sample rate
+
+        Returns:
+            output_path: Path to output WAV file
+        """
+        input_path = Path(input_path)
+
+        if output_path is None:
+            output_path = input_path.with_suffix(".wav")
+
+        # Load and convert
+        audio, sr = AudioConverter.load_audio(str(input_path), target_sr=sample_rate)
+
+        # Save as WAV
+        sf.write(str(output_path), audio, sr)
+
+        return str(output_path)
+
+    @staticmethod
+    def audio_to_binary(audio: np.ndarray, dtype: np.dtype = np.float32) -> bytes:
+        """
+        Convert audio array to binary format
+
+        Args:
+            audio: Audio signal as numpy array
+            dtype: Data type for conversion
+
+        Returns:
+            Binary representation of audio
+        """
+        return audio.astype(dtype).tobytes()
+
+    @staticmethod
+    def binary_to_audio(binary_data: bytes, dtype: np.dtype = np.float32) -> np.ndarray:
+        """
+        Convert binary data back to audio array
+
+        Args:
+            binary_data: Binary audio data
+            dtype: Data type for conversion
 
         Returns:
             Audio signal as numpy array
         """
-        # Try soundfile first (faster for WAV)
-        try:
-            audio, orig_sr = sf.read(io.BytesIO(binary_data))
-            if len(audio.shape) > 1:
-                audio = audio.mean(axis=1)  # Convert to mono
-            if orig_sr != sr:
-                audio = librosa.resample(audio, orig_sr=orig_sr, target_sr=sr)
-            return audio
-        except:
-            pass
+        return np.frombuffer(binary_data, dtype=dtype)
 
-        # Fallback to librosa (supports more formats)
-        audio, _ = librosa.load(io.BytesIO(binary_data), sr=sr, mono=True)
+    @staticmethod
+    def normalize_audio(audio: np.ndarray) -> np.ndarray:
+        """Normalize audio to [-1, 1] range"""
+        if np.max(np.abs(audio)) > 0:
+            return audio / np.max(np.abs(audio))
         return audio
 
-    @staticmethod
-    def load_audio_from_numpy(
-        audio_array: np.ndarray,
-        orig_sr: int,
-        target_sr: int = InferenceConfig.SAMPLE_RATE,
-    ) -> np.ndarray:
-        """
-        Load audio from numpy array with resampling.
 
-        Args:
-            audio_array: Audio signal as numpy array
-            orig_sr: Original sample rate
-            target_sr: Target sample rate
-
-        Returns:
-            Resampled audio signal
-        """
-        if orig_sr != target_sr:
-            audio_array = librosa.resample(
-                audio_array, orig_sr=orig_sr, target_sr=target_sr
-            )
-
-        if len(audio_array.shape) > 1:
-            audio_array = audio_array.mean(axis=1)  # Convert to mono
-
-        return audio_array
-
-    @staticmethod
-    def normalize_signal_length(
-        signal: np.ndarray, target_length: int = InferenceConfig.SIGNAL_LENGTH
-    ) -> np.ndarray:
-        """
-        Normalize signal to target length by padding or truncating.
-
-        Args:
-            signal: Input audio signal
-            target_length: Desired signal length
-
-        Returns:
-            Normalized signal
-        """
-        if len(signal) < target_length:
-            # Pad with zeros
-            signal = np.pad(signal, (0, target_length - len(signal)))
-        else:
-            # Truncate
-            signal = signal[:target_length]
-
-        return signal
-
-    @staticmethod
-    def extract_mfcc_features(
-        signal: np.ndarray, sr: int = InferenceConfig.SAMPLE_RATE
-    ) -> np.ndarray:
-        """
-        Extract MFCC features from audio signal.
-
-        Args:
-            signal: Audio signal
-            sr: Sample rate
-
-        Returns:
-            MFCC features with shape (n_mfcc * 3, time_steps)
-        """
-        # Normalize signal length
-        signal = AudioProcessor.normalize_signal_length(signal)
-
-        # Extract MFCC
-        mfcc = librosa.feature.mfcc(
-            y=signal,
-            sr=sr,
-            n_mfcc=InferenceConfig.N_MFCC,
-            n_fft=InferenceConfig.N_FFT,
-            hop_length=InferenceConfig.HOP_LENGTH,
-        )
-
-        # Extract delta and delta-delta
-        mfcc_delta = librosa.feature.delta(mfcc)
-        mfcc_delta2 = librosa.feature.delta(mfcc, order=2)
-
-        # Combine features
-        features = np.vstack([mfcc, mfcc_delta, mfcc_delta2])
-
-        return features
-
-
-class CoconutMaturityClassifier:
-    """ONNX Runtime-based classifier for coconut maturity."""
+class CoconutClassifier:
+    """Coconut maturity classifier using ONNX Runtime"""
 
     def __init__(
         self,
-        model_path: Union[str, Path, None] = None,
-        label_map_path: Union[str, Path, None] = None,
+        model_path: str,
+        metadata_path: Optional[str] = None,
+        n_mfcc: int = 40,
+        sample_rate: int = 44100,
+        max_len: int = 130,
     ):
         """
-        Initialize the classifier.
+        Initialize classifier
 
         Args:
-            model_path: Path to ONNX model. If None, uses default from config.
-            label_map_path: Path to label mapping JSON. If None, uses default from config.
+            model_path: Path to ONNX model
+            metadata_path: Path to metadata JSON (optional)
+            n_mfcc: Number of MFCC coefficients
+            sample_rate: Audio sample rate
+            max_len: Maximum length for MFCC features
         """
-        # Use config defaults if not provided
-        if model_path is None:
-            model_path = InferenceConfig.get_model_path()
-        if label_map_path is None:
-            label_map_path = InferenceConfig.get_label_map_path()
-
-        # Convert to Path objects
-        model_path = Path(model_path)
-        label_map_path = Path(label_map_path)
-
-        # Check if files exist
-        if not model_path.exists():
-            raise FileNotFoundError(
-                f"Model file not found: {model_path}\n"
-                f"Please ensure the model has been trained and exported."
-            )
-        if not label_map_path.exists():
-            raise FileNotFoundError(
-                f"Label map file not found: {label_map_path}\n"
-                f"Please ensure the model has been trained."
-            )
+        self.model_path = model_path
+        self.n_mfcc = n_mfcc
+        self.sample_rate = sample_rate
+        self.max_len = max_len
 
         # Load ONNX model
-        self.session = ort.InferenceSession(str(model_path))
-        self.input_name = self.session.get_inputs()[0].name
-        self.output_name = self.session.get_outputs()[0].name
+        self.session = ort.InferenceSession(model_path)
 
-        # Load label mapping
-        with open(label_map_path, "r") as f:
-            label_data = json.load(f)
-            self.label_names = label_data["label_names"]
+        # Load metadata if provided
+        if metadata_path and Path(metadata_path).exists():
+            with open(metadata_path, "r") as f:
+                metadata = json.load(f)
+                self.label_names = metadata.get("label_names", ["im", "m", "om"])
+                self.n_mfcc = metadata.get("n_mfcc", n_mfcc)
+                self.max_len = metadata.get("max_len", max_len)
+        else:
+            self.label_names = ["im", "m", "om"]  # premature, mature, overmature
 
-        self.audio_processor = AudioProcessor()
+        print(f"Loaded model: {model_path}")
+        print(f"Labels: {self.label_names}")
 
-    def predict_from_file(self, audio_path: Union[str, Path]) -> dict:
+    def extract_features(self, audio: np.ndarray) -> np.ndarray:
         """
-        Predict maturity level from audio file.
+        Extract MFCC features from audio
 
         Args:
-            audio_path: Path to audio file
+            audio: Audio signal
 
         Returns:
-            Dictionary with prediction results
+            MFCC features
         """
-        # Load audio
-        audio = self.audio_processor.load_audio_from_file(audio_path)
+        # Extract MFCC
+        mfcc = librosa.feature.mfcc(y=audio, sr=self.sample_rate, n_mfcc=self.n_mfcc)
+
+        # Pad or truncate to fixed length
+        if mfcc.shape[1] < self.max_len:
+            pad_width = self.max_len - mfcc.shape[1]
+            mfcc = np.pad(mfcc, ((0, 0), (0, pad_width)), mode="constant")
+        else:
+            mfcc = mfcc[:, : self.max_len]
+
+        return mfcc
+
+    def predict(
+        self, audio: Union[str, np.ndarray, bytes], return_probs: bool = False
+    ) -> Union[str, Tuple[str, np.ndarray]]:
+        """
+        Predict coconut maturity from audio
+
+        Args:
+            audio: Audio file path, numpy array, or binary data
+            return_probs: Whether to return class probabilities
+
+        Returns:
+            Predicted class label (and probabilities if return_probs=True)
+        """
+        # Handle different input types
+        if isinstance(audio, str):
+            # Load from file
+            audio_data, _ = AudioConverter.load_audio(audio, target_sr=self.sample_rate)
+        elif isinstance(audio, bytes):
+            # Convert from binary
+            audio_data = AudioConverter.binary_to_audio(audio)
+        else:
+            # Already numpy array
+            audio_data = audio
+
+        # Normalize audio
+        audio_data = AudioConverter.normalize_audio(audio_data)
 
         # Extract features
-        features = self.audio_processor.extract_mfcc_features(audio)
+        features = self.extract_features(audio_data)
 
-        # Run inference
-        return self._run_inference(features)
-
-    def predict_from_binary(self, audio_binary: bytes) -> dict:
-        """
-        Predict maturity level from binary audio data.
-
-        Args:
-            audio_binary: Raw audio bytes
-
-        Returns:
-            Dictionary with prediction results
-        """
-        # Load audio from binary
-        audio = self.audio_processor.load_audio_from_binary(audio_binary)
-
-        # Extract features
-        features = self.audio_processor.extract_mfcc_features(audio)
-
-        # Run inference
-        return self._run_inference(features)
-
-    def predict_from_numpy(
-        self, audio_array: np.ndarray, sample_rate: int = InferenceConfig.SAMPLE_RATE
-    ) -> dict:
-        """
-        Predict maturity level from numpy array.
-
-        Args:
-            audio_array: Audio signal as numpy array
-            sample_rate: Sample rate of the audio
-
-        Returns:
-            Dictionary with prediction results
-        """
-        # Resample if needed
-        if sample_rate != InferenceConfig.SAMPLE_RATE:
-            audio_array = self.audio_processor.load_audio_from_numpy(
-                audio_array, sample_rate, InferenceConfig.SAMPLE_RATE
-            )
-
-        # Extract features
-        features = self.audio_processor.extract_mfcc_features(audio_array)
-
-        # Run inference
-        return self._run_inference(features)
-
-    def _run_inference(self, features: np.ndarray) -> dict:
-        """
-        Run ONNX inference on features.
-
-        Args:
-            features: MFCC features
-
-        Returns:
-            Dictionary with prediction results
-        """
-        # Prepare input
+        # Prepare input for ONNX
         input_data = features[np.newaxis, :, :].astype(np.float32)
 
         # Run inference
-        outputs = self.session.run([self.output_name], {self.input_name: input_data})
-        logits = outputs[0][0]
+        input_name = self.session.get_inputs()[0].name
+        output_name = self.session.get_outputs()[0].name
 
-        # Apply softmax
-        exp_logits = np.exp(logits - np.max(logits))
-        probabilities = exp_logits / exp_logits.sum()
+        outputs = self.session.run([output_name], {input_name: input_data})[0]
 
         # Get prediction
-        predicted_class = int(np.argmax(probabilities))
-        predicted_label = self.label_names[predicted_class]
-        confidence = float(probabilities[predicted_class])
+        probs = self._softmax(outputs[0])
+        pred_idx = np.argmax(probs)
+        pred_label = self.label_names[pred_idx]
 
-        # Build result
-        result = {
-            "predicted_class": predicted_class,
-            "predicted_label": predicted_label,
-            "confidence": confidence,
-            "probabilities": {
-                self.label_names[i]: float(probabilities[i])
-                for i in range(len(self.label_names))
-            },
-        }
+        if return_probs:
+            return pred_label, probs
+        return pred_label
 
-        return result
+    @staticmethod
+    def _softmax(x: np.ndarray) -> np.ndarray:
+        """Compute softmax probabilities"""
+        exp_x = np.exp(x - np.max(x))
+        return exp_x / np.sum(exp_x)
+
+    def predict_batch(self, audio_list: list, return_probs: bool = False) -> list:
+        """
+        Predict maturity for multiple audio samples
+
+        Args:
+            audio_list: List of audio files/arrays
+            return_probs: Whether to return class probabilities
+
+        Returns:
+            List of predictions
+        """
+        results = []
+        for audio in audio_list:
+            result = self.predict(audio, return_probs=return_probs)
+            results.append(result)
+        return results
 
 
-def demo_inference():
-    """Demonstration of inference on random sample files."""
+def get_random_sample_file(samples_dir: str = "samples") -> Optional[str]:
+    """
+    Pick a random WAV file from samples/ridge-{a,b,c} directories
 
-    print("=" * 60)
-    print("Coconut Maturity Classification - Inference Demo")
-    print("=" * 60)
+    Args:
+        samples_dir: Base directory for samples
 
-    # Initialize classifier
-    print("\nInitializing classifier...")
-    classifier = CoconutMaturityClassifier()
-    print("✓ Classifier loaded successfully")
+    Returns:
+        Path to random sample file or None
+    """
+    samples_path = Path(samples_dir)
 
-    # Define sample directories
-    sample_dirs = [
-        Path("samples/ridge-a"),
-        Path("samples/ridge-b"),
-        Path("samples/ridge-c"),
+    # Look for ridge directories
+    ridge_dirs = [
+        samples_path / "ridge-a",
+        samples_path / "ridge-b",
+        samples_path / "ridge-c",
     ]
 
-    # Collect all WAV files
-    all_samples = []
-    for sample_dir in sample_dirs:
-        if sample_dir.exists():
-            wav_files = list(sample_dir.glob("*.wav"))
-            all_samples.extend(wav_files)
+    all_wav_files = []
+    for ridge_dir in ridge_dirs:
+        if ridge_dir.exists():
+            wav_files = list(ridge_dir.glob("*.wav"))
+            all_wav_files.extend(wav_files)
 
-    if not all_samples:
-        print("\n⚠ No sample files found in samples/ directories")
-        print("Please place WAV files in:")
-        for sample_dir in sample_dirs:
-            print(f"  - {sample_dir}")
+    if not all_wav_files:
+        print(f"No WAV files found in {samples_dir}/ridge-{{a,b,c}}")
+        return None
+
+    # Pick random file
+    random_file = random.choice(all_wav_files)
+    return str(random_file)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Coconut maturity classification inference"
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="models/coconut_classifier.onnx",
+        help="Path to ONNX model (default: models/coconut_classifier.onnx)",
+    )
+    parser.add_argument(
+        "--metadata",
+        type=str,
+        default="models/coconut_classifier_metadata.json",
+        help="Path to metadata JSON (default: models/coconut_classifier_metadata.json)",
+    )
+    parser.add_argument("--audio", type=str, help="Path to audio file for inference")
+    parser.add_argument(
+        "--samples_dir",
+        type=str,
+        default="samples",
+        help="Directory containing sample files (default: samples)",
+    )
+    parser.add_argument(
+        "--random", action="store_true", help="Use random sample from samples directory"
+    )
+    parser.add_argument("--convert", type=str, help="Convert audio file to WAV format")
+    parser.add_argument("--output", type=str, help="Output path for converted audio")
+    parser.add_argument(
+        "--show_probs", action="store_true", help="Show class probabilities"
+    )
+
+    args = parser.parse_args()
+
+    # Handle audio conversion
+    if args.convert:
+        print(f"Converting {args.convert} to WAV format...")
+        output_path = AudioConverter.convert_to_wav(
+            args.convert, output_path=args.output
+        )
+        print(f"✓ Saved to: {output_path}")
         return
 
-    # Pick a random sample
-    sample_file = random.choice(all_samples)
+    # Initialize classifier
+    print("=" * 60)
+    print("COCONUT MATURITY CLASSIFIER")
+    print("=" * 60)
 
-    print(f"\n📁 Selected sample: {sample_file}")
-    print(f"   Directory: {sample_file.parent.name}")
-    print(f"   Filename: {sample_file.name}")
+    classifier = CoconutClassifier(
+        model_path=args.model,
+        metadata_path=args.metadata if Path(args.metadata).exists() else None,
+    )
+
+    # Determine audio file to use
+    audio_file = None
+
+    if args.random:
+        # Use random sample
+        audio_file = get_random_sample_file(args.samples_dir)
+        if audio_file:
+            print(f"\nUsing random sample: {audio_file}")
+    elif args.audio:
+        # Use specified file
+        audio_file = args.audio
+        print(f"\nUsing specified file: {audio_file}")
+    else:
+        print("\nError: Please specify --audio or use --random flag")
+        return
+
+    if not audio_file or not Path(audio_file).exists():
+        print(f"Error: Audio file not found: {audio_file}")
+        return
 
     # Run inference
-    print("\n🔍 Running inference...")
-    result = classifier.predict_from_file(sample_file)
-
-    # Display results
     print("\n" + "=" * 60)
-    print("RESULTS")
-    print("=" * 60)
-    print(f"Predicted Maturity: {result['predicted_label'].upper()}")
-    print(f"Confidence: {result['confidence']:.2%}")
-    print("\nAll Probabilities:")
-    for label, prob in result["probabilities"].items():
-        bar_length = int(prob * 40)
-        bar = "█" * bar_length + "░" * (40 - bar_length)
-        print(f"  {label:12s} [{bar}] {prob:.2%}")
+    print("RUNNING INFERENCE")
     print("=" * 60)
 
-    # Demonstrate binary input
-    print("\n📦 Demonstrating binary input...")
-    with open(sample_file, "rb") as f:
-        audio_binary = f.read()
+    if args.show_probs:
+        pred_label, probs = classifier.predict(audio_file, return_probs=True)
 
-    result_binary = classifier.predict_from_binary(audio_binary)
-    print(
-        f"✓ Binary inference result: {result_binary['predicted_label']} ({result_binary['confidence']:.2%})"
-    )
+        print(f"\nPredicted maturity: {pred_label}")
+        print("\nClass probabilities:")
+        for label, prob in zip(classifier.label_names, probs):
+            print(f"  {label:>3s}: {prob:.4f} ({prob * 100:.2f}%)")
+    else:
+        pred_label = classifier.predict(audio_file)
+        print(f"\nPredicted maturity: {pred_label}")
 
-    # Demonstrate numpy input
-    print("\n🔢 Demonstrating numpy array input...")
-    audio_array, sr = librosa.load(sample_file, sr=None)
-    result_numpy = classifier.predict_from_numpy(audio_array, sr)
-    print(
-        f"✓ Numpy inference result: {result_numpy['predicted_label']} ({result_numpy['confidence']:.2%})"
-    )
+    # Decode label
+    label_mapping = {"im": "Premature (immature)", "m": "Mature", "om": "Overmature"}
 
-    print("\n✓ Demo complete!")
+    print(f"Classification: {label_mapping.get(pred_label, pred_label)}")
+
+    print("\n" + "=" * 60)
+    print("INFERENCE COMPLETE")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
-    demo_inference()
+    main()
