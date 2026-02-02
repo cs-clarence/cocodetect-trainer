@@ -1,0 +1,10 @@
+*.py[codz]
+__pycache__/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.pdm-python
+samples
+coconut_acoustic_signals.xlsx
+.preprocessed
+models
