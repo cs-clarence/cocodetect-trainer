@@ -37,3 +37,10 @@ train_chatgpt = "python src/chatgpt/train.py"
 inference = "python src/inference.py"
 inference_chatgpt = "python src/chatgpt/inference.py"
 decode = "python src/decode.py"
+
+[[tool.pdm.source]]
+name = "pytorch"
+type = "index"
+url = "https://download.pytorch.org/whl/cu130"
+verify_ssl = true
+include_packages = ["torch", "torchvision", "torchaudio"]
