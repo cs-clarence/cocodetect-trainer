@@ -29,6 +29,386 @@ from audiomentations import (
 )
 import librosa
 import numpy as np
+from scipy.signal import butter, lfilter
+
+
+# =============================================================================
+# Procedural Audio Generation & Additional Augmentations
+# Based on: "Deep learning classification system for coconut maturity levels
+#            based on acoustic signals" (Caladcad & Piedad, 2024)
+# Paper reference: https://arxiv.org/abs/2408.14910
+# =============================================================================
+
+def apply_vibrato(
+    audio: np.ndarray,
+    sr: int,
+    vibrato_rate: float = 5.0,
+    vibrato_depth: float = 0.5,
+) -> np.ndarray:
+    """
+    Apply vibrato effect to audio signal.
+    
+    Vibrato modulates the pitch periodically, creating a wavering effect.
+    Referenced in Table II of the paper as `audio_vibrato = vibrato((audio, sr))`.
+    
+    Args:
+        audio: Input audio signal (1D numpy array)
+        sr: Sample rate
+        vibrato_rate: Rate of vibrato oscillation in Hz (default 5.0)
+        vibrato_depth: Depth of pitch modulation in semitones (default 0.5)
+    
+    Returns:
+        Audio with vibrato effect applied
+    """
+    if len(audio) == 0:
+        return audio
+    
+    # Create time array
+    t = np.arange(len(audio)) / sr
+    
+    # Create modulation signal (sinusoidal LFO)
+    modulation = vibrato_depth * np.sin(2 * np.pi * vibrato_rate * t)
+    
+    # Apply pitch modulation using phase vocoder approach
+    # For efficiency, we'll use a simplified time-domain approach
+    # by resampling with varying rate
+    n_samples = len(audio)
+    
+    # Calculate instantaneous phase shift
+    phase_shift = np.cumsum(modulation) / sr
+    
+    # Create new sample indices with phase modulation
+    indices = np.arange(n_samples) + phase_shift * sr * 0.01
+    indices = np.clip(indices, 0, n_samples - 1)
+    
+    # Interpolate to get vibrato effect
+    output = np.interp(np.arange(n_samples), indices, audio)
+    
+    return output.astype(np.float32)
+
+
+def harmonic_percussive_separation(
+    audio: np.ndarray,
+    sr: int,
+    margin: float = 1.0,
+    return_type: str = "both",
+) -> np.ndarray:
+    """
+    Apply Harmonic-Percussive Source Separation (HPSS).
+    
+    Referenced in Table II of the paper as `audio_sep = harmonic_percussive_separation((audio, sr))`.
+    This separates audio into harmonic (tonal) and percussive (transient) components.
+    
+    Args:
+        audio: Input audio signal (1D numpy array)
+        sr: Sample rate
+        margin: Separation margin (higher = more separation)
+        return_type: "harmonic", "percussive", "both" (returns mix), or "random"
+    
+    Returns:
+        Separated/mixed audio signal
+    """
+    if len(audio) == 0:
+        return audio
+    
+    # Compute STFT
+    stft = librosa.stft(audio)
+    
+    # Apply HPSS
+    harmonic, percussive = librosa.decompose.hpss(stft, margin=margin)
+    
+    # Convert back to time domain
+    harmonic_audio = librosa.istft(harmonic, length=len(audio))
+    percussive_audio = librosa.istft(percussive, length=len(audio))
+    
+    if return_type == "harmonic":
+        return harmonic_audio.astype(np.float32)
+    elif return_type == "percussive":
+        return percussive_audio.astype(np.float32)
+    elif return_type == "random":
+        # Randomly choose or mix
+        choice = np.random.choice(["harmonic", "percussive", "mix"])
+        if choice == "harmonic":
+            return harmonic_audio.astype(np.float32)
+        elif choice == "percussive":
+            return percussive_audio.astype(np.float32)
+        else:
+            # Random mix ratio
+            ratio = np.random.uniform(0.3, 0.7)
+            return (ratio * harmonic_audio + (1 - ratio) * percussive_audio).astype(np.float32)
+    else:  # "both" - return weighted mix
+        # Mix with slight emphasis on one or the other randomly
+        ratio = np.random.uniform(0.4, 0.6)
+        return (ratio * harmonic_audio + (1 - ratio) * percussive_audio).astype(np.float32)
+
+
+def butter_lowpass(cutoff: float, fs: int, order: int = 5) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Design a Butterworth lowpass filter.
+    
+    Referenced in Table II of the paper as procedural generation method.
+    
+    Args:
+        cutoff: Cutoff frequency in Hz
+        fs: Sample rate
+        order: Filter order (default 5, paper uses order=6)
+    
+    Returns:
+        Filter coefficients (b, a)
+    """
+    nyq = 0.5 * fs
+    normal_cutoff = cutoff / nyq
+    # Clamp to valid range
+    normal_cutoff = np.clip(normal_cutoff, 0.001, 0.999)
+    b, a = butter(order, normal_cutoff, btype='low', analog=False)
+    return b, a
+
+
+def butter_lowpass_filter(
+    data: np.ndarray,
+    cutoff: float,
+    fs: int,
+    order: int = 5,
+) -> np.ndarray:
+    """
+    Apply Butterworth lowpass filter to data.
+    
+    Args:
+        data: Input signal
+        cutoff: Cutoff frequency in Hz
+        fs: Sample rate
+        order: Filter order
+    
+    Returns:
+        Filtered signal
+    """
+    b, a = butter_lowpass(cutoff, fs, order)
+    y = lfilter(b, a, data)
+    return y.astype(np.float32)
+
+
+def apply_time_varying_lowpass_filter(
+    audio: np.ndarray,
+    sr: int,
+    filter_order: int = 6,
+    window_size: int = 1024,
+    overlap: float = 0.5,
+    min_cutoff: float = 1000.0,
+    max_cutoff: float = 8000.0,
+) -> np.ndarray:
+    """
+    Apply time-varying lowpass filter using windowed processing.
+    
+    Referenced in Table II of the paper as:
+    `applying_time_varying_lowpass_filter(audio_data, sr)` with:
+    - filter_order = 6
+    - window_size = 1024
+    - overlap = 0.5
+    
+    This creates a procedural audio effect where the lowpass cutoff
+    frequency varies over time, simulating different acoustic conditions.
+    
+    Args:
+        audio: Input audio signal (1D numpy array)
+        sr: Sample rate
+        filter_order: Butterworth filter order (default 6 per paper)
+        window_size: Window size in samples (default 1024 per paper)
+        overlap: Overlap ratio between windows (default 0.5 per paper)
+        min_cutoff: Minimum cutoff frequency in Hz
+        max_cutoff: Maximum cutoff frequency in Hz
+    
+    Returns:
+        Audio with time-varying lowpass filter applied
+    """
+    if len(audio) == 0:
+        return audio
+    
+    hop_size = int(window_size * (1 - overlap))
+    n_windows = max(1, (len(audio) - window_size) // hop_size + 1)
+    
+    # Generate random cutoff frequencies for each window
+    cutoffs = np.random.uniform(min_cutoff, max_cutoff, n_windows)
+    
+    # Smooth the cutoff transitions
+    if n_windows > 1:
+        # Simple moving average smoothing
+        kernel_size = min(5, n_windows)
+        kernel = np.ones(kernel_size) / kernel_size
+        cutoffs = np.convolve(cutoffs, kernel, mode='same')
+    
+    # Output buffer
+    output = np.zeros_like(audio)
+    window_sum = np.zeros_like(audio)
+    
+    # Hann window for smooth overlap-add
+    window = np.hanning(window_size)
+    
+    for i in range(n_windows):
+        start = i * hop_size
+        end = min(start + window_size, len(audio))
+        actual_len = end - start
+        
+        if actual_len < 10:
+            continue
+        
+        # Get window of audio
+        segment = audio[start:end].copy()
+        
+        # Apply Butterworth lowpass filter with current cutoff
+        cutoff = cutoffs[i]
+        try:
+            filtered = butter_lowpass_filter(segment, cutoff, sr, filter_order)
+        except Exception:
+            filtered = segment  # Fallback if filter fails
+        
+        # Apply window and overlap-add
+        current_window = window[:actual_len] if actual_len < window_size else window
+        output[start:end] += filtered * current_window
+        window_sum[start:end] += current_window
+    
+    # Normalize by window sum to avoid amplitude changes
+    nonzero_mask = window_sum > 1e-8
+    output[nonzero_mask] /= window_sum[nonzero_mask]
+    output[~nonzero_mask] = audio[~nonzero_mask]
+    
+    return output.astype(np.float32)
+
+
+def apply_dynamic_range_compression(
+    audio: np.ndarray,
+    threshold: float = 0.3,
+    ratio: float = 4.0,
+    attack_ms: float = 5.0,
+    release_ms: float = 50.0,
+    sr: int = 44100,
+) -> np.ndarray:
+    """
+    Apply dynamic range compression.
+    
+    Referenced in Table II as `compression_factor = random.uniform(0.1, 0.5)`.
+    This reduces the dynamic range of the audio signal.
+    
+    Args:
+        audio: Input audio signal
+        threshold: Threshold level (0-1) above which compression is applied
+        ratio: Compression ratio (e.g., 4.0 means 4:1 compression)
+        attack_ms: Attack time in milliseconds
+        release_ms: Release time in milliseconds
+        sr: Sample rate
+    
+    Returns:
+        Compressed audio signal
+    """
+    if len(audio) == 0:
+        return audio
+    
+    # Convert times to samples
+    attack_samples = int(attack_ms * sr / 1000)
+    release_samples = int(release_ms * sr / 1000)
+    
+    # Compute envelope using peak detection
+    envelope = np.abs(audio)
+    
+    # Smooth envelope with attack/release
+    smoothed_env = np.zeros_like(envelope)
+    smoothed_env[0] = envelope[0]
+    
+    attack_coef = 1.0 - np.exp(-1.0 / max(1, attack_samples))
+    release_coef = 1.0 - np.exp(-1.0 / max(1, release_samples))
+    
+    for i in range(1, len(envelope)):
+        if envelope[i] > smoothed_env[i - 1]:
+            smoothed_env[i] = attack_coef * envelope[i] + (1 - attack_coef) * smoothed_env[i - 1]
+        else:
+            smoothed_env[i] = release_coef * envelope[i] + (1 - release_coef) * smoothed_env[i - 1]
+    
+    # Apply compression
+    gain = np.ones_like(smoothed_env)
+    above_threshold = smoothed_env > threshold
+    
+    if np.any(above_threshold):
+        # Calculate gain reduction
+        gain[above_threshold] = threshold + (smoothed_env[above_threshold] - threshold) / ratio
+        gain[above_threshold] /= smoothed_env[above_threshold]
+    
+    # Apply gain to original signal
+    output = audio * gain
+    
+    return output.astype(np.float32)
+
+
+class ProceduralAudioAugmenter:
+    """
+    Procedural audio augmentation class implementing techniques from the paper.
+    
+    Combines audiomentation transforms with procedural generation methods
+    for comprehensive data augmentation as described in Caladcad & Piedad (2024).
+    """
+    
+    def __init__(
+        self,
+        sr: int = 44100,
+        strength: float = 1.0,
+        p_vibrato: float = 0.3,
+        p_hpss: float = 0.25,
+        p_time_varying_lpf: float = 0.3,
+        p_compression: float = 0.25,
+    ):
+        """
+        Initialize procedural audio augmenter.
+        
+        Args:
+            sr: Sample rate
+            strength: Overall augmentation strength multiplier
+            p_vibrato: Probability of applying vibrato
+            p_hpss: Probability of applying harmonic-percussive separation
+            p_time_varying_lpf: Probability of applying time-varying lowpass filter
+            p_compression: Probability of applying dynamic range compression
+        """
+        self.sr = sr
+        self.strength = strength
+        self.p_vibrato = p_vibrato
+        self.p_hpss = p_hpss
+        self.p_time_varying_lpf = p_time_varying_lpf
+        self.p_compression = p_compression
+    
+    def __call__(self, audio: np.ndarray) -> np.ndarray:
+        """Apply procedural augmentations to audio."""
+        s = self.strength
+        
+        # Vibrato
+        if np.random.random() < self.p_vibrato:
+            vibrato_rate = np.random.uniform(3.0, 7.0) * s
+            vibrato_depth = np.random.uniform(0.2, 0.8) * s
+            audio = apply_vibrato(audio, self.sr, vibrato_rate, vibrato_depth)
+        
+        # Harmonic-Percussive Separation
+        if np.random.random() < self.p_hpss:
+            margin = np.random.uniform(1.0, 3.0) * s
+            audio = harmonic_percussive_separation(audio, self.sr, margin, return_type="random")
+        
+        # Time-varying lowpass filter
+        if np.random.random() < self.p_time_varying_lpf:
+            min_cutoff = np.random.uniform(500, 2000)
+            max_cutoff = np.random.uniform(4000, 10000)
+            audio = apply_time_varying_lowpass_filter(
+                audio, self.sr,
+                filter_order=6,
+                window_size=1024,
+                overlap=0.5,
+                min_cutoff=min_cutoff,
+                max_cutoff=max_cutoff,
+            )
+        
+        # Dynamic range compression
+        if np.random.random() < self.p_compression:
+            threshold = np.random.uniform(0.1, 0.5)
+            ratio = np.random.uniform(2.0, 6.0)
+            audio = apply_dynamic_range_compression(
+                audio, threshold=threshold, ratio=ratio, sr=self.sr
+            )
+        
+        return audio
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -62,7 +442,16 @@ class Config:
     SAMPLE_RATE = 44100
 
 class CoconutDataset(Dataset):
-    """Dataset for coconut acoustic signals with MFCC extraction and optional audiomentations pipeline."""
+    """Dataset for coconut acoustic signals with MFCC extraction and optional audiomentations pipeline.
+    
+    Implements augmentation techniques from:
+    "Deep learning classification system for coconut maturity levels based on acoustic signals"
+    (Caladcad & Piedad, 2024) - https://arxiv.org/abs/2408.14910
+    
+    Augmentation methods include:
+    - Audiomentation: time stretch, pitch shift, shift, noise, gain, filters
+    - Procedural Generation: vibrato, HPSS, time-varying lowpass filter, compression
+    """
 
     def __init__(
         self,
@@ -74,7 +463,6 @@ class CoconutDataset(Dataset):
         augment: bool = False,
         aug_prob: float = 0.5,
         aug_strength: float = 1.0,
-        use_audiomentations: bool = True,
         seed: Optional[int] = None,
     ):
         self.signals = signals
@@ -85,41 +473,51 @@ class CoconutDataset(Dataset):
         self.augment = augment
         self.aug_prob = float(aug_prob)
         self.aug_strength = float(aug_strength)
-        self.use_audiomentations = use_audiomentations and (Compose is not None)
 
         if seed is not None:
             random.seed(seed)
             np.random.seed(seed)
 
-        # Build audiomentations pipeline if requested
+        # Build audiomentations pipeline (always used when augmenting)
         self.augmenter = None
-        if self.augment and self.use_audiomentations:
+        if self.augment:
+            if Compose is None:
+                raise RuntimeError(
+                    "audiomentations is not available. Install it with `pip install audiomentations`."
+                )
             # Strength scales intensity / ranges of transforms
             s = max(0.0, float(self.aug_strength))
             # Compose a set of transforms similar to the study (time-stretch, pitch, shift, noise, gain, filters)
             self.augmenter = Compose(
                 [
-                    # Add light gaussian noise
-                    AddGaussianNoise(min_amplitude=0.001 * s, max_amplitude=0.015 * s, p=0.5),
-                    # Time stretch (warp)
-                    TimeStretch(min_rate=0.85 ** s, max_rate=1.15 ** s, p=0.4),
-                    # Pitch shift in semitones
-                    PitchShift(min_semitones=int(-2 * s), max_semitones=int(2 * s), p=0.4),
-                    # Shift (roll)
+                    # Add light gaussian noise - paper: noise_factor = random.uniform(0, 0.05)
+                    AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.05 * s, p=0.5),
+                    # Time stretch (warp) - paper: stretch_factor = random.uniform(0.8, 1.2)
+                    TimeStretch(min_rate=0.8 ** s, max_rate=1.2 ** s, p=0.4),
+                    # Pitch shift in semitones - paper: pitch_factor = random.randint(-3, 3)
+                    PitchShift(min_semitones=int(-3 * s), max_semitones=int(3 * s), p=0.4),
+                    # Shift (roll) - paper: shift_factor = random.uniform(-0.1, 0.1)
                     Shift(min_shift=-0.1 * s, max_shift=0.1 * s, p=0.5),
                     # Random gain (compression / gain)
                     Gain(min_gain_db=-6.0 * s, max_gain_db=6.0 * s, p=0.4),
-                    # Slight lowpass or highpass sometimes (procedural filtering)
+                    # Lowpass/highpass filters - paper: filter_factor = random.randint(10, 90)
                     LowPassFilter(min_cutoff_freq=3000, max_cutoff_freq=int(8000 * s), p=0.25),
                     HighPassFilter(min_cutoff_freq=20, max_cutoff_freq=200, p=0.15),
                     # Mild clipping / distortion occasionally to simulate recording artifacts
                     ClippingDistortion(min_percentile_threshold=0, max_percentile_threshold=int(5 * s), p=0.1),
                 ]
             )
-        elif self.augment and not self.use_audiomentations:
-            raise RuntimeError(
-                "audiomentations is not available. Install it with `pip install audiomentations` "
-                "or run without --augment."
+        
+        # Build procedural audio augmenter (always used when augmenting)
+        self.procedural_augmenter = None
+        if self.augment:
+            self.procedural_augmenter = ProceduralAudioAugmenter(
+                sr=sample_rate,
+                strength=self.aug_strength,
+                p_vibrato=0.3,
+                p_hpss=0.25,
+                p_time_varying_lpf=0.3,
+                p_compression=0.25,
             )
 
     def __len__(self):
@@ -143,13 +541,31 @@ class CoconutDataset(Dataset):
         augmented = augmented.astype(np.float32)
         return augmented
 
+    def _maybe_procedural_augment(self, signal: np.ndarray) -> np.ndarray:
+        """Apply procedural audio augmentation (vibrato, HPSS, time-varying LPF, compression)"""
+        if not self.augment or self.procedural_augmenter is None:
+            return signal
+        if random.random() > self.aug_prob:
+            return signal
+        
+        # Normalize to [-1, 1] range
+        sig = signal.astype(np.float32)
+        max_abs = np.max(np.abs(sig)) if sig.size > 0 else 1.0
+        if max_abs > 1.0:
+            sig = sig / max_abs
+        
+        augmented = self.procedural_augmenter(sig)
+        return augmented.astype(np.float32)
+
     def __getitem__(self, idx):
         signal = self.signals[idx].astype(np.float32)
         label = self.labels[idx]
 
-        # optionally augment raw waveform
+        # optionally augment raw waveform with audiomentations
         if self.augment:
             signal = self._maybe_augment(signal)
+            # Apply procedural augmentation (independent probability)
+            signal = self._maybe_procedural_augment(signal)
 
         # Extract MFCC features
         mfcc = librosa.feature.mfcc(y=signal, sr=self.sample_rate, n_mfcc=self.n_mfcc, n_fft=2048, hop_length=512)
@@ -164,7 +580,16 @@ class CoconutDataset(Dataset):
         return torch.FloatTensor(mfcc), torch.LongTensor([label])[0]
 
 def build_audiomentations_pipeline(aug_strength: float = 1.0):
-    """Return an audiomentations.Compose pipeline (same defaults used for on-the-fly)."""
+    """Return an audiomentations.Compose pipeline (same defaults used for on-the-fly).
+    
+    Implements deformation techniques from Table II of the paper:
+    - stretch_factor = random.uniform(0.8, 1.2)
+    - pitch_factor = random.randint(-3, 3)
+    - shift_factor = random.uniform(-0.1, 0.1)
+    - noise_factor = random.uniform(0, 0.05)
+    - compression_factor = random.uniform(0.1, 0.5)
+    - filter_factor = random.randint(10, 90)
+    """
     if Compose is None:
         raise RuntimeError(
             "audiomentations not installed. Please install with `pip install audiomentations`."
@@ -173,16 +598,42 @@ def build_audiomentations_pipeline(aug_strength: float = 1.0):
     s = max(0.0, float(aug_strength))
     return Compose(
         [
-            AddGaussianNoise(min_amplitude=0.001 * s, max_amplitude=0.015 * s, p=0.5),
-            TimeStretch(min_rate=0.85 ** s, max_rate=1.15 ** s, p=0.4),
-            PitchShift(min_semitones=int(-2 * s), max_semitones=int(2 * s), p=0.4),
-            Shift(min_fraction=-0.1 * s, max_fraction=0.1 * s, p=0.5),
-            Gain(min_gain_in_db=-6.0 * s, max_gain_in_db=6.0 * s, p=0.4),
-            LowPassFilter(min_low_pass_freq=3000, max_low_pass_freq=int(8000 * s), p=0.25),
-            HighPassFilter(min_high_pass_freq=20, max_high_pass_freq=200, p=0.15),
+            # noise_factor = random.uniform(0, 0.05)
+            AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.05 * s, p=0.5),
+            # stretch_factor = random.uniform(0.8, 1.2)
+            TimeStretch(min_rate=0.8 ** s, max_rate=1.2 ** s, p=0.4),
+            # pitch_factor = random.randint(-3, 3)
+            PitchShift(min_semitones=int(-3 * s), max_semitones=int(3 * s), p=0.4),
+            # shift_factor = random.uniform(-0.1, 0.1)
+            Shift(min_shift=-0.1 * s, max_shift=0.1 * s, p=0.5),
+            # compression_factor handled by Gain + ClippingDistortion
+            Gain(min_gain_db=-6.0 * s, max_gain_db=6.0 * s, p=0.4),
+            # filter_factor = random.randint(10, 90) - interpreted as frequency percentile
+            LowPassFilter(min_cutoff_freq=3000, max_cutoff_freq=int(8000 * s), p=0.25),
+            HighPassFilter(min_cutoff_freq=20, max_cutoff_freq=200, p=0.15),
             ClippingDistortion(min_percentile_threshold=0, max_percentile_threshold=int(5 * s), p=0.1),
         ]
     )
+
+
+def build_procedural_augmenter(sr: int = 44100, aug_strength: float = 1.0) -> ProceduralAudioAugmenter:
+    """Build a procedural audio augmenter for offline augmentation.
+    
+    Implements procedural generation techniques from Table II of the paper:
+    - applying_time_varying_lowpass_filter (filter_order=6, window_size=1024, overlap=0.5)
+    - butter_lowpass / butter_lowpass_filter (Butterworth filters)
+    - vibrato
+    - harmonic_percussive_separation
+    """
+    return ProceduralAudioAugmenter(
+        sr=sr,
+        strength=aug_strength,
+        p_vibrato=0.3,
+        p_hpss=0.25,
+        p_time_varying_lpf=0.3,
+        p_compression=0.25,
+    )
+
 
 def generate_offline_augmented_dataset(
     signals: np.ndarray,
@@ -194,14 +645,29 @@ def generate_offline_augmented_dataset(
     seed: int = 42,
     out_dir: str = ".preprocessed",
     original_source_id: Optional[str] = None,  # used for cache filename uniqueness
+    use_procedural: bool = True,  # Enable procedural audio generation
 ) -> Tuple[np.ndarray, np.ndarray, str]:
     """
-    Create an augmented dataset on disk using audiomentations.
-    - signals: np.ndarray of raw waveforms (1D arrays)
-    - labels: integer labels (same length)
-    - label_names: mapping of label id -> name
-    - target_total: desired total number of samples in the augmented dataset
-    - returns (aug_signals, aug_labels, cache_path)
+    Create an augmented dataset on disk using audiomentations and procedural generation.
+    
+    Implements augmentation techniques from:
+    "Deep learning classification system for coconut maturity levels based on acoustic signals"
+    (Caladcad & Piedad, 2024) - https://arxiv.org/abs/2408.14910
+    
+    Args:
+        signals: np.ndarray of raw waveforms (1D arrays)
+        labels: integer labels (same length)
+        label_names: mapping of label id -> name
+        target_total: desired total number of samples in the augmented dataset
+        sample_rate: audio sample rate
+        aug_strength: augmentation strength multiplier
+        seed: random seed for reproducibility
+        out_dir: output directory for cached dataset
+        original_source_id: used for cache filename uniqueness
+        use_procedural: whether to apply procedural generation (vibrato, HPSS, time-varying LPF)
+    
+    Returns:
+        (aug_signals, aug_labels, cache_path)
     """
 
     if Compose is None:
@@ -212,32 +678,39 @@ def generate_offline_augmented_dataset(
 
     os.makedirs(out_dir, exist_ok=True)
 
-    # compute class counts and desired per-class counts (preserve proportions)
+    source_tag = original_source_id or "orig"
+    cache_name = f"augmented_{source_tag}_{len(signals)}to{target_total}.npz"
+
+    if os.path.exists(os.path.join(out_dir, cache_name)):
+        print(f"💾 Augmented dataset cache found, loading: {cache_name}")
+        data = np.load(os.path.join(out_dir, cache_name), allow_pickle=False)  # Fast load, no pickle
+        return data["signals"], data["labels"], os.path.join(out_dir, cache_name)
+    
+    # compute class counts and balance classes by oversampling minorities
     unique, counts = np.unique(labels, return_counts=True)
     total_original = len(labels)
     class_counts = dict(zip(unique.tolist(), counts.tolist()))
 
-    # compute target per class (proportional rounding)
-    target_per_class = {}
-    for cls in unique:
-        frac = class_counts[cls] / total_original
-        target_per_class[cls] = int(round(frac * target_total))
+    # Balance classes: each class gets target_total / num_classes samples
+    num_classes = len(unique)
+    samples_per_class = target_total // num_classes
+    target_per_class = {cls: samples_per_class for cls in unique}
+    
+    # Distribute remainder to classes (starting from minority classes)
+    remainder = target_total - (samples_per_class * num_classes)
+    sorted_classes = sorted(unique.tolist(), key=lambda c: class_counts[c])  # ascending by original count
+    for i in range(remainder):
+        target_per_class[sorted_classes[i % num_classes]] += 1
+    
+    print(f"⚖️  Balancing classes: {samples_per_class} samples per class (total: {target_total})")
 
-    # adjust rounding to exactly match target_total (distribute error)
-    assigned = sum(target_per_class.values())
-    diff = target_total - assigned
-    if diff != 0:
-        # sort classes by descending original size to distribute remainder
-        sorted_classes = sorted(unique.tolist(), key=lambda c: class_counts[c], reverse=True)
-        idx = 0
-        step = 1 if diff > 0 else -1
-        while diff != 0:
-            target_per_class[sorted_classes[idx % len(sorted_classes)]] += step
-            diff -= step
-            idx += 1
-
-    # build augmenter
+    # Build audiomentations augmenter
     augmenter = build_audiomentations_pipeline(aug_strength)
+    
+    # Build procedural augmenter if enabled
+    procedural_augmenter = None
+    if use_procedural:
+        procedural_augmenter = build_procedural_augmenter(sr=sample_rate, aug_strength=aug_strength)
 
     # Build index lists for each class
     class_indices = defaultdict(list)
@@ -252,7 +725,9 @@ def generate_offline_augmented_dataset(
         augmented_signals.append(sig.astype(np.float32))
         augmented_labels.append(int(labels[i]))
 
-    print(f"🔁 Generating offline augmented dataset: original={len(signals)} target_total={target_total}")
+    aug_type_str = "audiomentations + procedural" if use_procedural else "audiomentations only"
+    print(f"🔁 Generating offline augmented dataset ({aug_type_str}): original={len(signals)} target_total={target_total}")
+    
     # For each class, generate required extra samples
     pbar_total = sum(max(0, target_per_class[cls] - class_counts[cls]) for cls in unique)
     from tqdm import tqdm
@@ -285,7 +760,13 @@ def generate_offline_augmented_dataset(
                 base_sig = base_sig / max_abs
 
             try:
+                # Apply audiomentations
                 aug = augmenter(samples=base_sig, sample_rate=sample_rate)
+                
+                # Apply procedural augmentation (with 50% probability per sample)
+                if procedural_augmenter is not None and rng.random() < 0.5:
+                    aug = procedural_augmenter(aug)
+                    
             except Exception as e:
                 # if any failure occurs, fallback to small gaussian noise
                 aug = base_sig + 1e-6 * rng.randn(base_sig.shape[0]).astype(np.float32)
@@ -308,17 +789,15 @@ def generate_offline_augmented_dataset(
 
     pbar.close()
 
-    aug_signals = np.array(augmented_signals, dtype=object)  # keep as object array of 1D arrays
+    # Stack into 2D array for fast saving/loading (all signals same length after padding)
+    aug_signals = np.stack(augmented_signals).astype(np.float32)  # (N, signal_len)
     aug_labels = np.array(augmented_labels, dtype=np.int32)
 
-    # Save cache file unique to original_source_id (hash) and target_total
-    source_tag = original_source_id or "orig"
-    cache_name = f"augmented_{source_tag}_{len(signals)}to{target_total}.npz"
     cache_path = os.path.join(out_dir, cache_name)
 
-    # we will save as allow_pickle arrays for variable-length waveforms (but in your dataset signals likely same length)
-    np.savez(cache_path, signals=aug_signals, labels=aug_labels, label_names=label_names)
-    print(f"💾 Augmented dataset saved: {cache_path} (total={len(augmented_labels)})")
+    # Save as contiguous arrays (no pickle needed, much faster load)
+    np.savez(cache_path, signals=aug_signals, labels=aug_labels)
+    print(f"💾 Augmented dataset saved: {cache_path} (total={len(aug_labels)}, shape={aug_signals.shape})")
 
     return aug_signals, aug_labels, cache_path
 
@@ -591,6 +1070,7 @@ def train_model(
     model_name: str = "coconut_classifier",
     resume: bool = False,
     early_stopping_patience: int = 10,
+    class_weights: Optional[torch.Tensor] = None,
 ) -> Tuple[nn.Module, dict]:
     """
     Train the coconut classification model with checkpointing
@@ -612,7 +1092,12 @@ def train_model(
     latest_checkpoint = checkpoint_path / f"{model_name}_latest.pth"
 
     model = model.to(device)
-    criterion = nn.CrossEntropyLoss()
+    if class_weights is not None:
+        class_weights = class_weights.to(device)
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
+        print(f"📊 Using class weights: {class_weights.tolist()}")
+    else:
+        criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", patience=5, factor=0.5
@@ -875,7 +1360,11 @@ def main():
         "--val_split", type=float, default=0.1, help="Validation set split"
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--augment", action="store_true", help="Enable data augmentation")
+    parser.add_argument(
+        "--augment_dataset",
+        action="store_true",
+        help="Enable data augmentation using audiomentations + procedural generation (Caladcad & Piedad, 2024)",
+    )
     parser.add_argument(
         "--aug_prob", type=float, default=0.5, help="Per-sample augmentation probability (0-1)"
     )
@@ -886,26 +1375,21 @@ def main():
         help="Augmentation strength multiplier (>=0.0). Lower -> milder; Higher -> stronger",
     )
     parser.add_argument(
-        "--use_audiomentations",
-        action="store_true",
-        help="When --augment is used, use the audiomentations library (recommended)",
-    )
-    parser.add_argument(
-        "--offline_augment",
-        action="store_true",
-        help="Generate an offline augmented dataset and save to disk before training",
-    )
-    parser.add_argument(
         "--target_size",
         type=int,
         default=13950,
-        help="When --offline_augment is used, target total dataset size (default 13950)",
+        help="Target total dataset size after augmentation (default 13950 per paper)",
     )
     parser.add_argument(
         "--aug_cache_dir",
         type=str,
         default=".preprocessed",
-        help="Directory to save offline augmented dataset cache",
+        help="Directory to save augmented dataset cache",
+    )
+    parser.add_argument(
+        "--use_class_weights",
+        action="store_true",
+        help="Use inverse-frequency class weights to handle imbalanced data",
     )
 
     args = parser.parse_args()
@@ -933,39 +1417,8 @@ def main():
         args.data, signal_count=args.signal_count
     )
 
-    if args.offline_augment:
-        print("\n" + "=" * 60)
-        print("OFFLINE AUGMENTATION: Generating augmented dataset")
-        print("=" * 60)
-        # build augmenter (we use aug_strength and seed)
-        aug_signals, aug_labels, cache_path = generate_offline_augmented_dataset(
-            signals=signals,
-            labels=labels,
-            label_names=label_names,
-            target_total=args.target_size,
-            sample_rate=Config.SAMPLE_RATE,
-            aug_strength=args.aug_strength,
-            seed=args.seed,
-            out_dir=args.aug_cache_dir,
-            original_source_id=hashlib.md5(open(args.data, "rb").read()).hexdigest()[:8],
-        )
-
-        # Replace loaded signals/labels with augmented ones for subsequent splitting/training
-        # If the saved format used object arrays, convert to a 2D array if shape consistent
-        # Attempt to stack if possible
-        try:
-            # try to stack to 2D array (n_signals, signal_length)
-            signals = np.stack(aug_signals).astype(np.float32)
-        except Exception:
-            # keep as object arrays; CoconutDataset handles variable lengths by padding/truncating during MFCC
-            signals = np.array(aug_signals, dtype=object)
-        labels = np.array(aug_labels, dtype=np.int32)
-
-        print(f"   Using augmented dataset cache: {cache_path}")
-        print(f"   New dataset size: {len(signals)} samples")
-
-    # Split data
-    print("=" * 60)
+    # Split data BEFORE augmentation to prevent data leakage
+    print("\n" + "=" * 60)
     print("SPLITTING DATA")
     print("=" * 60)
 
@@ -986,38 +1439,71 @@ def main():
         stratify=y_temp,
     )
 
-    print(f"  Train set: {len(X_train)} samples")
+    print(f"  Original train set: {len(X_train)} samples")
     print(f"  Validation set: {len(X_val)} samples")
     print(f"  Test set: {len(X_test)} samples")
 
-    if args.augment:
-        print(f"🔀 Data augmentation enabled (prob={args.aug_prob}, strength={args.aug_strength})")
-        if args.use_audiomentations:
-            print("   Using audiomentations pipeline.")
-        else:
-            print("   Using audiomentations when available (fallback will error if not installed).")
+    # Augment ONLY training data (val/test remain clean)
+    if args.augment_dataset:
+        print("\n" + "=" * 60)
+        print("DATA AUGMENTATION: Augmenting training set only")
+        print("=" * 60)
+        print("   Using audiomentations + procedural generation (Caladcad & Piedad, 2024)")
+        print("   ⚠️  Validation and test sets remain unaugmented (no data leakage)")
+        
+        # Calculate target size for training set only (proportional to original split)
+        train_target = int(args.target_size * (1 - args.test_split) * (1 - val_size_adjusted))
+        
+        aug_signals, aug_labels, cache_path = generate_offline_augmented_dataset(
+            signals=X_train,
+            labels=y_train,
+            label_names=label_names,
+            target_total=train_target,
+            sample_rate=Config.SAMPLE_RATE,
+            aug_strength=args.aug_strength,
+            seed=args.seed,
+            out_dir=args.aug_cache_dir,
+            original_source_id=hashlib.md5(open(args.data, "rb").read()).hexdigest()[:8] + "_train",
+            use_procedural=True,
+        )
+
+        # Replace training data with augmented version (already stacked float32/int32 from cache)
+        X_train = aug_signals
+        y_train = aug_labels
+
+        print(f"   Augmented train set: {len(X_train)} samples")
+        print(f"   Using cache: {cache_path}")
+
+    print(f"\n  Final train set: {len(X_train)} samples")
+    print(f"  Validation set: {len(X_val)} samples (unaugmented)")
+    print(f"  Test set: {len(X_test)} samples (unaugmented)")
+
+    # On-the-fly augmentation can be used in addition to offline augmentation
+    use_online_augment = args.augment_dataset
+    if use_online_augment:
+        print(f"🔀 On-the-fly augmentation enabled (prob={args.aug_prob}, strength={args.aug_strength})")
+        print("   Using audiomentations + procedural generation (vibrato, HPSS, time-varying LPF, compression)")
 
     # Create datasets
     train_dataset = CoconutDataset(
         X_train,
         y_train,
         n_mfcc=args.n_mfcc,
-        augment=args.augment,
+        augment=use_online_augment,
         aug_prob=args.aug_prob,
         aug_strength=args.aug_strength,
-        use_audiomentations=args.use_audiomentations or True,  # prefer audiomentations when available
         seed=args.seed,
     )
     val_dataset = CoconutDataset(X_val, y_val, n_mfcc=args.n_mfcc, augment=False)
     test_dataset = CoconutDataset(X_test, y_test, n_mfcc=args.n_mfcc, augment=False)
     train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2
+        train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2
+        val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0
     )
     test_loader = DataLoader(
-        test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2
+        test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0
     )
 
     # Create model
@@ -1036,6 +1522,27 @@ def main():
     print("\n" + "=" * 60)
     print("TRAINING MODEL")
     print("=" * 60)
+    
+    # Show class distribution in training set
+    from collections import Counter
+    class_counts = Counter(y_train)
+    total_samples = len(y_train)
+    print(f"📊 Class distribution in training set:")
+    for i, name in enumerate(label_names):
+        count = class_counts.get(i, 0)
+        print(f"   {name}: {count} samples ({100*count/total_samples:.1f}%)")
+    
+    # Compute class weights if enabled
+    class_weights = None
+    if args.use_class_weights:
+        # Inverse frequency weighting: weight = total / (num_classes * class_count)
+        num_classes = len(label_names)
+        class_weights = torch.tensor(
+            [total_samples / (num_classes * class_counts.get(i, 1)) for i in range(num_classes)],
+            dtype=torch.float32
+        )
+        print(f"⚖️  Class weights enabled: {class_weights.tolist()}")
+    
     model, history = train_model(
         model,
         train_loader,
@@ -1047,6 +1554,7 @@ def main():
         model_name=args.model_name,
         resume=args.resume,
         early_stopping_patience=args.early_stopping,
+        class_weights=class_weights,
     )
 
     # Evaluate on test set

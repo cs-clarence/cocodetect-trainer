@@ -229,7 +229,8 @@ class CoconutClassifier:
                 raise RuntimeError(f"Unable to load model checkpoint from {path}: {e}")
 
     def extract_features(self, audio: np.ndarray) -> np.ndarray:
-        mfcc = librosa.feature.mfcc(y=audio, sr=self.sample_rate, n_mfcc=self.n_mfcc)
+        # Must match training parameters: n_fft=2048, hop_length=512
+        mfcc = librosa.feature.mfcc(y=audio, sr=self.sample_rate, n_mfcc=self.n_mfcc, n_fft=2048, hop_length=512)
         if mfcc.shape[1] < self.max_len:
             pad_width = self.max_len - mfcc.shape[1]
             mfcc = np.pad(mfcc, ((0, 0), (0, pad_width)), mode="constant")
