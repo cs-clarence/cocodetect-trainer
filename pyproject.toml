@@ -1,22 +1,28 @@
 [project]
-name = "coconut_sorter_trainer"
+name = "cocodetect-trainer"
 version = "0.1.0"
 description = "Default template for PDM package"
 authors = [
     {name = "Clarence Manuel", email = "rencedm112@gmail.com"},
+    {name = "Clarence Manuel", email = "Clarence.Manuel@dayforce.com"},
 ]
 dependencies = [
     "torch>=2.10.0",
     "torchvision>=0.25.0",
     "torchaudio>=2.10.0",
     "numpy>=2.3.5",
+    "scipy>=1.14.0",
     "scikit-learn>=1.8.0",
     "librosa>=0.11.0",
     "soundfile>=0.13.1",
     "openpyxl>=3.1.5",
     "onnxruntime>=1.23.2",
-    "pydub>=0.25.1"
-
+    "pydub>=0.25.1",
+    "audiomentations>=0.43.1",
+    "onnx>=1.20.1",
+    "pandas>=3.0.0",
+    "tqdm>=4.67.2",
+    "onnxscript>=0.6.0",
 ]
 requires-python = "==3.13.*"
 readme = "README.md"
@@ -28,7 +34,14 @@ distribution = false
 
 [tool.pdm.scripts]
 train = "python src/train.py"
-train_improved = "python src/train_improved.py"
-diagnose_overfitting = "python src/diagnose_overfitting.py"
+train_chatgpt = "python src/chatgpt/train.py"
 inference = "python src/inference.py"
+inference_chatgpt = "python src/chatgpt/inference.py"
 decode = "python src/decode.py"
+
+[[tool.pdm.source]]
+name = "pytorch"
+type = "index"
+url = "https://download.pytorch.org/whl/cu130"
+verify_ssl = true
+include_packages = ["torch", "torchvision", "torchaudio"]

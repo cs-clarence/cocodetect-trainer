@@ -1,0 +1,138 @@
+import numpy as np
+import librosa
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, accuracy_score
+import audiomentations as am
+import warnings
+warnings.filterwarnings('ignore')
+
+print('=== TESTING PAPER ARCHITECTURE (Conv1D + LSTM) ===')
+print()
+
+# Load data
+data = np.load('.preprocessed/coconut_data_519fd8cd410dfeb2de3b536b3cf67c25_132300.npz', allow_pickle=True)
+signals = data['signals']
+labels = data['labels']
+
+sr = 44100
+
+# Augmentation
+augment = am.Compose([
+    am.TimeStretch(min_rate=0.8, max_rate=1.2, p=0.5),
+    am.PitchShift(min_semitones=-3, max_semitones=3, p=0.5),
+    am.AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.015, p=0.5),
+    am.Shift(min_shift=-0.1, max_shift=0.1, p=0.5),
+])
+
+target_per_class = 1350  # Similar ratio to paper (4050/3)
+
+print('Augmenting data...')
+aug_signals = []
+aug_labels = []
+
+for class_idx in range(3):
+    class_sigs = signals[labels == class_idx]
+    for sig in class_sigs:
+        aug_signals.append(sig)
+        aug_labels.append(class_idx)
+    
+    while len([l for l in aug_labels if l == class_idx]) < target_per_class:
+        idx = np.random.randint(0, len(class_sigs))
+        aug_sig = augment(samples=class_sigs[idx], sample_rate=sr)
+        if len(aug_sig) > 132300:
+            aug_sig = aug_sig[:132300]
+        elif len(aug_sig) < 132300:
+            aug_sig = np.pad(aug_sig, (0, 132300 - len(aug_sig)))
+        aug_signals.append(aug_sig.astype(np.float32))
+        aug_labels.append(class_idx)
+
+aug_signals = np.array(aug_signals)
+aug_labels = np.array(aug_labels)
+print(f'Augmented: {len(aug_signals)} samples')
+
+# Extract MFCC sequences (not just mean)
+print('Extracting 128 MFCC sequences...')
+X = []
+for sig in aug_signals:
+    mfcc = librosa.feature.mfcc(y=sig, sr=sr, n_mfcc=128, n_fft=2048, hop_length=512)
+    X.append(mfcc.T)  # (time, features)
+
+X = np.array(X, dtype=np.float32)
+y = aug_labels
+print(f'MFCC shape: {X.shape}')
+
+# Split 90/10 like paper
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.1, stratify=y, random_state=42)
+
+# Paper model architecture
+class CoconutLSTM(nn.Module):
+    def __init__(self, input_size=128, hidden_size=64, num_classes=3):
+        super().__init__()
+        self.conv1 = nn.Conv1d(input_size, 32, 3, padding=1)
+        self.conv2 = nn.Conv1d(32, 64, 3, padding=1)
+        self.pool = nn.AvgPool1d(1)
+        self.lstm = nn.LSTM(64, hidden_size, batch_first=True)
+        self.dropout = nn.Dropout(0.5)
+        self.fc = nn.Linear(hidden_size, num_classes)
+        
+    def forward(self, x):
+        # x: (batch, time, features) -> (batch, features, time)
+        x = x.permute(0, 2, 1)
+        x = torch.relu(self.conv1(x))
+        x = torch.relu(self.conv2(x))
+        x = self.pool(x)
+        # Back to (batch, time, features)
+        x = x.permute(0, 2, 1)
+        lstm_out, _ = self.lstm(x)
+        x = lstm_out[:, -1, :]  # Last timestep
+        x = self.dropout(x)
+        return self.fc(x)
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f'Device: {device}')
+
+# Data loaders
+train_dataset = TensorDataset(torch.FloatTensor(X_train), torch.LongTensor(y_train))
+test_dataset = TensorDataset(torch.FloatTensor(X_test), torch.LongTensor(y_test))
+train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=128)
+
+# Train
+model = CoconutLSTM().to(device)
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+print('Training...')
+for epoch in range(60):
+    model.train()
+    for X_batch, y_batch in train_loader:
+        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+        optimizer.zero_grad()
+        outputs = model(X_batch)
+        loss = criterion(outputs, y_batch)
+        loss.backward()
+        optimizer.step()
+    
+    if (epoch + 1) % 20 == 0:
+        print(f'Epoch {epoch+1}, Loss: {loss.item():.4f}')
+
+# Evaluate
+model.eval()
+all_preds = []
+all_labels = []
+with torch.no_grad():
+    for X_batch, y_batch in test_loader:
+        X_batch = X_batch.to(device)
+        outputs = model(X_batch)
+        preds = outputs.argmax(dim=1).cpu().numpy()
+        all_preds.extend(preds)
+        all_labels.extend(y_batch.numpy())
+
+print()
+print('=== RESULTS (Paper Architecture: Conv1D + LSTM) ===')
+print(f'Accuracy: {accuracy_score(all_labels, all_preds):.4f}')
+print()
+print(classification_report(all_labels, all_preds, target_names=['im', 'm', 'om']))
