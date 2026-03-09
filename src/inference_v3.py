@@ -8,10 +8,15 @@ This inference script uses the paper architecture from train_v3.py:
 - Features: 128 MFCC time sequences (full temporal information)
 - Model: Conv1D + LSTM architecture from Caladcad & Piedad (2024)
 
+Model Format Support:
+- PyTorch (.pth): Full PyTorch model with GPU support
+- ONNX (.onnx): Optimized for faster inference, cross-platform compatibility
+
 Key Differences from V1/V2:
 1. Uses MFCC sequences (not mean/std pooling) - preserves temporal info
 2. Uses PyTorch Conv1D + LSTM (not SVM)
 3. Better at capturing acoustic dynamics over time
+4. Supports ONNX format for production deployment
 
 DATA SOURCE OPTIONS:
 1. --from_cache: Load directly from cached .npz data (same as training)
@@ -25,8 +30,11 @@ Usage:
     python inference_v3.py --from_cache --random --show_probs
     python inference_v3.py --from_cache --index 42 --show_probs
 
-    # From audio file
+    # From audio file (PyTorch model)
     python inference_v3.py --audio path/to/coconut.wav --show_probs
+
+    # Using ONNX model (faster inference)
+    python inference_v3.py --model models/coconut_classifier_v3.onnx --from_cache --random
 
 Reference:
     Caladcad & Piedad (2024) - https://arxiv.org/abs/2408.14910
@@ -42,6 +50,7 @@ from typing import List, Optional, Tuple, Union
 
 import librosa
 import numpy as np
+import onnxruntime as ort
 import soundfile as sf
 import torch
 import torch.nn as nn
@@ -267,11 +276,14 @@ class CoconutClassifierV3:
     - MFCC sequence features (preserves temporal information)
     - Conv1D + LSTM model
 
+    Supports both PyTorch (.pth) and ONNX (.onnx) models.
+
     Attributes:
-        model: Trained PyTorch model
+        model: Trained model (PyTorch or ONNX runtime)
+        model_type: 'pytorch' or 'onnx'
         label_names: Class names ['im', 'm', 'om']
         n_mfcc: Number of MFCC coefficients
-        device: PyTorch device
+        device: PyTorch device (for PyTorch models)
     """
 
     def __init__(
@@ -284,17 +296,26 @@ class CoconutClassifierV3:
         Initialize the classifier.
 
         Args:
-            model_path: Path to .pth model file
+            model_path: Path to .pth or .onnx model file
             metadata_path: Path to metadata JSON (optional)
-            device: PyTorch device (auto-detected if None)
+            device: PyTorch device (auto-detected if None, only for PyTorch models)
         """
         self.model_path = model_path
+        model_path_obj = Path(model_path)
 
-        # Device selection
-        if device is None:
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        # Detect model type from extension
+        if model_path_obj.suffix == ".onnx":
+            self.model_type = "onnx"
+            self.device = "cpu"  # ONNX runtime handles device internally
+        elif model_path_obj.suffix == ".pth":
+            self.model_type = "pytorch"
+            # Device selection for PyTorch
+            if device is None:
+                self.device = "cuda" if torch.cuda.is_available() else "cpu"
+            else:
+                self.device = device
         else:
-            self.device = device
+            raise ValueError(f"Unsupported model format: {model_path_obj.suffix}")
 
         # Load metadata
         if metadata_path and Path(metadata_path).exists():
@@ -315,14 +336,18 @@ class CoconutClassifierV3:
             self.hidden_size = Config.HIDDEN_SIZE
 
         # Load model
-        self._load_model(model_path)
+        if self.model_type == "onnx":
+            self._load_onnx_model(model_path)
+        else:
+            self._load_pytorch_model(model_path)
 
         print(f"✓ Loaded model: {model_path}")
+        print(f"  Model type: {self.model_type.upper()}")
         print(f"  Device: {self.device}")
         print(f"  Labels: {self.label_names}")
         print(f"  Architecture: Conv1D + LSTM (MFCC sequences)")
 
-    def _load_model(self, path: str):
+    def _load_pytorch_model(self, path: str):
         """Load PyTorch model from checkpoint."""
         path = Path(path)
         if not path.exists():
@@ -346,6 +371,22 @@ class CoconutClassifierV3:
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.model.to(self.device)
         self.model.eval()
+
+    def _load_onnx_model(self, path: str):
+        """Load ONNX model."""
+        path = Path(path)
+        if not path.exists():
+            raise FileNotFoundError(f"Model file not found: {path}")
+
+        # Create ONNX runtime session
+        # Use available providers (CUDA, CPU, etc.)
+        providers = ["CPUExecutionProvider"]
+        if ort.get_device() == "GPU":
+            providers.insert(0, "CUDAExecutionProvider")
+
+        self.model = ort.InferenceSession(str(path), providers=providers)
+        self.onnx_input_name = self.model.get_inputs()[0].name
+        self.onnx_output_name = self.model.get_outputs()[0].name
 
     def extract_features(self, audio: np.ndarray) -> np.ndarray:
         """Extract MFCC sequence from audio."""
@@ -390,15 +431,25 @@ class CoconutClassifierV3:
         # Extract features
         mfcc_seq = self.extract_features(audio_data)  # (time, n_mfcc)
 
-        # Prepare tensor
-        x = (
-            torch.FloatTensor(mfcc_seq).unsqueeze(0).to(self.device)
-        )  # (1, time, n_mfcc)
-
-        # Predict
-        with torch.no_grad():
-            outputs = self.model(x)
-            probs = F.softmax(outputs, dim=1).cpu().numpy()[0]
+        # Predict based on model type
+        if self.model_type == "onnx":
+            # ONNX inference
+            x = mfcc_seq.astype(np.float32)[np.newaxis, ...]  # (1, time, n_mfcc)
+            outputs = self.model.run(
+                [self.onnx_output_name], {self.onnx_input_name: x}
+            )[0]
+            # Apply softmax to get probabilities
+            exp_outputs = np.exp(outputs - np.max(outputs, axis=1, keepdims=True))
+            probs = exp_outputs / np.sum(exp_outputs, axis=1, keepdims=True)
+            probs = probs[0]
+        else:
+            # PyTorch inference
+            x = (
+                torch.FloatTensor(mfcc_seq).unsqueeze(0).to(self.device)
+            )  # (1, time, n_mfcc)
+            with torch.no_grad():
+                outputs = self.model(x)
+                probs = F.softmax(outputs, dim=1).cpu().numpy()[0]
 
         pred_idx = int(np.argmax(probs))
         pred_label = self.label_names[pred_idx]
@@ -504,6 +555,7 @@ def main():
 METHODOLOGY (Paper Architecture):
   - Features: 128 MFCC time sequences
   - Model: Conv1D + LSTM (Caladcad & Piedad, 2024)
+  - Supports both PyTorch (.pth) and ONNX (.onnx) models
 
 EXAMPLES:
   # From cached training data (recommended)
@@ -512,14 +564,17 @@ EXAMPLES:
 
   # From audio file
   python inference_v3.py --audio path/to/coconut.wav --show_probs
+
+  # Using ONNX model (faster inference)
+  python inference_v3.py --model models/coconut_classifier_v3.onnx --from_cache --random --show_probs
         """,
     )
 
     parser.add_argument(
         "--model",
         type=str,
-        default="models/coconut_classifier_v3.pth",
-        help="Path to model .pth file",
+        default="models/coconut_classifier_v3.onnx",
+        help="Path to model file (.pth for PyTorch, .onnx for ONNX)",
     )
     parser.add_argument(
         "--metadata",
