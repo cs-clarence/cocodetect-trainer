@@ -697,7 +697,7 @@ METHODOLOGY (Paper Architecture):
 EXAMPLES:
   # Standard training with ONNX export
   python train_v3.py --data coconut_acoustic_signals.xlsx --epochs 60
-  
+
   # Skip ONNX export (PyTorch only)
   python train_v3.py --data coconut_acoustic_signals.xlsx --epochs 60 --no_onnx
         """,
@@ -747,9 +747,7 @@ EXAMPLES:
     parser.add_argument(
         "--no_augment", action="store_true", help="Disable augmentation"
     )
-    parser.add_argument(
-        "--no_onnx", action="store_true", help="Disable ONNX export"
-    )
+    parser.add_argument("--no_onnx", action="store_true", help="Disable ONNX export")
     parser.add_argument(
         "--seed", type=int, default=Config.RANDOM_STATE, help="Random seed"
     )
@@ -908,10 +906,10 @@ EXAMPLES:
     print("\n" + "=" * 60)
     print("✅ TRAINING COMPLETE!")
     print("=" * 60)
-    print(f"\n📊 Results:")
+    print("\n📊 Results:")
     print(f"   Accuracy: {results['accuracy']:.1%}")
     print(f"   Balanced Accuracy: {results['balanced_accuracy']:.1%}")
-    print(f"\n💡 Use inference_v3.py for predictions.")
+    print("\n💡 Use inference_v3.py for predictions.")
 
 
 if __name__ == "__main__":
