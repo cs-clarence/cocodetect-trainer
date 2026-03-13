@@ -31,6 +31,10 @@ Key Features:
    - Test set contains only original samples never seen during training
    - This is the correct methodology (paper had data leakage)
 
+5. ONNX EXPORT: Models are exported to ONNX format for faster inference
+   - Compatible with ONNX Runtime for cross-platform deployment
+   - Use --no_onnx to skip ONNX export if needed
+
 Expected Performance (with proper methodology):
 - Accuracy: ~75%
 - Balanced Accuracy: ~68-70%
@@ -542,12 +546,89 @@ def evaluate_model(
     }
 
 
+def export_to_onnx(
+    model: nn.Module,
+    export_dir: str,
+    model_name: str = "coconut_classifier_v3",
+    input_size: int = Config.N_MFCC,
+    example_seq_length: int = 259,  # Typical MFCC sequence length
+    device: str = "cpu",
+) -> Optional[str]:
+    """
+    Export PyTorch model to ONNX format using legacy exporter.
+
+    Uses the legacy ONNX exporter (dynamo=False) for better LSTM compatibility.
+    The new torch.export-based exporter has issues with LSTM and dynamic shapes.
+
+    Args:
+        model: Trained PyTorch model
+        export_dir: Directory to save ONNX model
+        model_name: Base name for the model file
+        input_size: Number of MFCC coefficients (features)
+        example_seq_length: Example sequence length for tracing
+        device: Device to use for export
+
+    Returns:
+        Path to exported ONNX model, or None if export failed
+    """
+    try:
+        export_path = Path(export_dir)
+        export_path.mkdir(exist_ok=True, parents=True)
+        onnx_path = export_path / f"{model_name}.onnx"
+
+        # Set model to eval mode
+        model.eval()
+        model = model.to(device)
+
+        # Create dummy input: (batch_size=1, time_steps, n_mfcc)
+        dummy_input = torch.randn(1, example_seq_length, input_size).to(device)
+
+        # Export to ONNX
+        print(f"🔄 Exporting to ONNX format...")
+        print(f"   Input shape: {dummy_input.shape} (batch, time, features)")
+
+        # Use legacy exporter (dynamo=False) for better LSTM compatibility
+        torch.onnx.export(
+            model,
+            dummy_input,
+            str(onnx_path),
+            export_params=True,
+            opset_version=18,  # Use opset 18 as recommended
+            do_constant_folding=True,
+            input_names=["input"],
+            output_names=["output"],
+            dynamic_axes={
+                "input": {0: "batch_size", 1: "sequence_length"},
+                "output": {0: "batch_size"},
+            },
+            dynamo=False,  # Use legacy exporter for LSTM compatibility
+        )
+
+        print(f"✓ ONNX model saved: {onnx_path}")
+
+        # Verify the exported model
+        import onnx
+
+        onnx_model = onnx.load(str(onnx_path))
+        onnx.checker.check_model(onnx_model)
+        print(f"✓ ONNX model verified successfully")
+
+        return str(onnx_path)
+
+    except Exception as e:
+        print(f"⚠️  ONNX export failed: {e}")
+        print(f"   PyTorch model is still available at .pth format")
+        return None
+
+
 def save_model(
     model: nn.Module,
     label_names: List[str],
     export_dir: str,
     model_name: str = "coconut_classifier_v3",
     metadata: Optional[dict] = None,
+    export_onnx: bool = True,
+    device: str = "cpu",
 ):
     """Save trained model and metadata."""
     export_path = Path(export_dir)
@@ -565,6 +646,16 @@ def save_model(
         model_path,
     )
     print(f"✓ Model saved: {model_path}")
+
+    # Export to ONNX
+    if export_onnx:
+        export_to_onnx(
+            model,
+            export_dir,
+            model_name,
+            input_size=model.input_size,
+            device=device,
+        )
 
     # Save metadata
     meta = {
@@ -601,9 +692,14 @@ METHODOLOGY (Paper Architecture):
   - Model: Conv1D (128->32->64) + LSTM (hidden=64) + Dropout(0.5)
   - Augmentation: TimeStretch, PitchShift, GaussianNoise, Shift
   - Training: 90/10 split, 60 epochs, Adam optimizer
+  - Export: Both PyTorch (.pth) and ONNX (.onnx) formats
 
-EXAMPLE:
+EXAMPLES:
+  # Standard training with ONNX export
   python train_v3.py --data coconut_acoustic_signals.xlsx --epochs 60
+  
+  # Skip ONNX export (PyTorch only)
+  python train_v3.py --data coconut_acoustic_signals.xlsx --epochs 60 --no_onnx
         """,
     )
 
@@ -650,6 +746,9 @@ EXAMPLE:
     )
     parser.add_argument(
         "--no_augment", action="store_true", help="Disable augmentation"
+    )
+    parser.add_argument(
+        "--no_onnx", action="store_true", help="Disable ONNX export"
     )
     parser.add_argument(
         "--seed", type=int, default=Config.RANDOM_STATE, help="Random seed"
@@ -796,7 +895,15 @@ EXAMPLE:
         },
     }
 
-    save_model(model, label_names, args.export_dir, args.model_name, metadata)
+    save_model(
+        model,
+        label_names,
+        args.export_dir,
+        args.model_name,
+        metadata,
+        export_onnx=not args.no_onnx,
+        device=device,
+    )
 
     print("\n" + "=" * 60)
     print("✅ TRAINING COMPLETE!")
