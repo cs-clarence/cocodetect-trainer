@@ -389,6 +389,7 @@ class CoconutClassifierV3:
         self.onnx_output_name = self.model.get_outputs()[0].name
 
     def extract_features(self, audio: np.ndarray) -> np.ndarray:
+        print(f"extracting_features: {audio.shape}")
         """Extract MFCC sequence from audio."""
         return extract_mfcc_sequence(
             audio,
@@ -430,11 +431,13 @@ class CoconutClassifierV3:
 
         # Extract features
         mfcc_seq = self.extract_features(audio_data)  # (time, n_mfcc)
+        print(f"mfcc_seq shape: {mfcc_seq.shape}")
 
         # Predict based on model type
         if self.model_type == "onnx":
             # ONNX inference
             x = mfcc_seq.astype(np.float32)[np.newaxis, ...]  # (1, time, n_mfcc)
+
             outputs = self.model.run(
                 [self.onnx_output_name], {self.onnx_input_name: x}
             )[0]
